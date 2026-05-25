@@ -1,0 +1,76 @@
+# agent-fn-wrap
+
+Wrap Python functions as Anthropic tool schemas — auto-generates `input_schema` from type hints.
+
+Zero dependencies. Python 3.10+. MIT.
+
+## Install
+
+```bash
+pip install agent-fn-wrap
+```
+
+## Usage
+
+```python
+from agent_fn_wrap import ToolRegistry
+
+registry = ToolRegistry()
+
+@registry.tool(description="Search the web for current information.")
+def web_search(q: str, max_results: int = 5) -> str:
+    return search_api.query(q, n=max_results)
+
+@registry.tool(description="Read a local file.")
+def read_file(path: str) -> str:
+    return open(path).read()
+
+# Get Anthropic-style tool schemas
+schemas = registry.schemas()
+# [{"name": "web_search", "description": "...", "input_schema": {...}}, ...]
+
+# Pass to the API
+response = client.messages.create(
+    model="claude-sonnet-4-5",
+    tools=schemas,
+    messages=messages,
+)
+
+# Call a tool by name from the LLM's tool_use block
+result = registry.call("web_search", {"q": "Paris", "max_results": 3})
+```
+
+## Auto-generated schema
+
+Type hints map to JSON Schema types:
+- `str` → `"string"`
+- `int` → `"integer"`
+- `float` → `"number"`
+- `bool` → `"boolean"`
+
+Parameters without defaults are marked `required`. Parameters with defaults get the default value in the schema.
+
+## Description from docstring
+
+```python
+@registry.tool
+def web_search(q: str) -> str:
+    """Search the web for current information."""
+    return search(q)
+# description = "Search the web for current information."
+```
+
+## Schema override
+
+```python
+@registry.tool(description="Search.", schema_override={
+    "type": "object",
+    "properties": {"q": {"type": "string", "description": "Search query"}},
+    "required": ["q"],
+})
+def search(q): ...
+```
+
+## License
+
+MIT
