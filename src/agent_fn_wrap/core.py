@@ -7,7 +7,9 @@ Zero dependencies — uses inspect and typing from the standard library.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, get_type_hints
+import types
+import typing
+from typing import Any, Callable, get_args, get_origin, get_type_hints
 
 
 class ToolWrapError(Exception):
@@ -34,19 +36,56 @@ def _get_default_registry() -> "ToolRegistry":
     return _DEFAULT_REGISTRY
 
 
+def _is_union(origin: Any) -> bool:
+    """Return True if ``origin`` is a union origin (typing.Union or X | Y).
+
+    Works across Python versions where ``X | Y`` may report its origin as
+    ``types.UnionType`` (3.10) or ``typing.Union`` (3.14+).
+    """
+    if origin is typing.Union:
+        return True
+    union_type = getattr(types, "UnionType", None)
+    return union_type is not None and origin is union_type
+
+
 def _json_type(annotation: Any) -> str:
-    """Convert a Python type annotation to a JSON Schema type string."""
-    if annotation is inspect.Parameter.empty:
+    """Convert a Python type annotation to a JSON Schema type string.
+
+    Handles bare types (``str`` -> ``"string"``), parameterized generics
+    (``list[int]`` -> ``"array"``), and optionals/unions
+    (``int | None`` / ``Optional[int]`` -> ``"integer"``), picking the first
+    non-``None`` member of a union. Unknown annotations fall back to
+    ``"string"``.
+    """
+    if annotation is inspect.Parameter.empty or annotation is None:
         return "string"
-    # Handle Optional[X] (Union[X, None]) from 3.10+
-    origin = getattr(annotation, "__origin__", None)
-    if origin is type(None):
-        return "string"
-    # Union types — pick the first non-None
-    if str(origin) in ("<class 'types.UnionType'>", "typing.Union"):
-        args = [a for a in getattr(annotation, "__args__", []) if a is not type(None)]
+
+    origin = get_origin(annotation)
+
+    # Union / Optional — pick the first non-None member.
+    if _is_union(origin):
+        args = [a for a in get_args(annotation) if a is not type(None)]
         return _json_type(args[0]) if args else "string"
+
+    # Parameterized generics such as list[str] or dict[str, int]: map the
+    # container origin (list -> "array", dict -> "object").
+    if origin is not None:
+        return _TYPE_MAP.get(origin, "string")
+
     return _TYPE_MAP.get(annotation, "string")
+
+
+def _array_item_type(annotation: Any) -> str | None:
+    """Return the JSON Schema type of a parameterized list's element type.
+
+    For ``list[int]`` this returns ``"integer"``; for a bare ``list`` (no
+    element type) it returns ``None`` so no ``items`` key is emitted.
+    """
+    if get_origin(annotation) is list:
+        args = get_args(annotation)
+        if args:
+            return _json_type(args[0])
+    return None
 
 
 def _build_schema(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -63,17 +102,29 @@ def _build_schema(fn: Callable[..., Any]) -> dict[str, Any]:
     for name, param in sig.parameters.items():
         if name in ("self", "cls"):
             continue
+        # *args / **kwargs cannot be expressed as named JSON Schema
+        # properties, so they are skipped rather than emitted as scalars.
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
         annotation = hints.get(name, inspect.Parameter.empty)
         json_type = _json_type(annotation)
         prop: dict[str, Any] = {"type": json_type}
 
-        # Use param's default as description hint if it's a string sentinel
+        # For typed arrays (e.g. list[str]), include the element type so the
+        # model knows what the items should look like.
+        if json_type == "array":
+            item_type = _array_item_type(annotation)
+            if item_type is not None:
+                prop["items"] = {"type": item_type}
+
         if param.default is inspect.Parameter.empty:
             required.append(name)
         else:
             prop["default"] = param.default
 
-        # Pull description from docstring param section if present
         properties[name] = prop
 
     schema: dict[str, Any] = {"type": "object", "properties": properties}
@@ -212,9 +263,21 @@ def tool(
     *,
     name: str | None = None,
     description: str = "",
+    schema_override: dict[str, Any] | None = None,
 ) -> Any:
-    """Register a function as a tool in the default global registry."""
-    return _get_default_registry().tool(fn, name=name, description=description)
+    """Register a function as a tool in the default global registry.
+
+    Mirrors :meth:`ToolRegistry.tool` but operates on a process-wide default
+    registry, which is convenient for small scripts. Use a dedicated
+    :class:`ToolRegistry` instance when you need isolation (e.g. in tests or
+    when serving multiple agents).
+    """
+    return _get_default_registry().tool(
+        fn,
+        name=name,
+        description=description,
+        schema_override=schema_override,
+    )
 
 
 def get_tools() -> list[dict[str, Any]]:
@@ -225,3 +288,13 @@ def get_tools() -> list[dict[str, Any]]:
 def call_tool(name: str, input_data: dict[str, Any]) -> Any:
     """Call a tool by name using the default global registry."""
     return _get_default_registry().call(name, input_data)
+
+
+def reset_default_registry() -> None:
+    """Clear the process-wide default registry.
+
+    Primarily useful in tests to isolate state between cases that exercise the
+    module-level :func:`tool`, :func:`get_tools`, and :func:`call_tool` API.
+    """
+    global _DEFAULT_REGISTRY
+    _DEFAULT_REGISTRY = None
